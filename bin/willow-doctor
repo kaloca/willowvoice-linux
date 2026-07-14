@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+set -u
+
+failures=0
+warnings=0
+data_root="${WILLOW_BRIDGE_DATA_ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/willow-linux-bridge}"
+
+ok() {
+  printf '  [ok] %s\n' "$*"
+}
+
+warn() {
+  printf '  [warn] %s\n' "$*"
+  warnings=$((warnings + 1))
+}
+
+fail() {
+  printf '  [fail] %s\n' "$*"
+  failures=$((failures + 1))
+}
+
+printf '%s\n' 'Willow Linux bridge doctor'
+
+if [[ "$(uname -m)" == x86_64 ]]; then
+  ok 'x86-64 host'
+else
+  fail "unsupported architecture: $(uname -m)"
+fi
+
+if [[ -e /etc/arch-release ]]; then
+  ok 'Arch Linux host'
+else
+  warn 'this release is tested only on Arch Linux'
+fi
+
+if [[ "${XDG_SESSION_TYPE:-unknown}" == wayland ]]; then
+  ok 'Wayland session'
+else
+  warn "session type is ${XDG_SESSION_TYPE:-unknown}; expected wayland"
+fi
+if [[ "${XDG_CURRENT_DESKTOP:-}" == *KDE* || "${KDE_FULL_SESSION:-}" == true ]]; then
+  ok 'KDE Plasma session'
+else
+  warn 'KDE Plasma session was not detected'
+fi
+if [[ -n "${DISPLAY:-}" ]]; then
+  ok "XWayland display is available"
+else
+  fail 'DISPLAY is unset; Willow cannot be targeted through XWayland'
+fi
+
+for command_name in cmp wine wineserver xdotool ydotool ydotoold wl-copy wl-paste python3 systemctl; do
+  if command -v "$command_name" >/dev/null 2>&1; then
+    ok "$command_name is installed"
+  else
+    fail "$command_name is missing"
+  fi
+done
+
+if [[ -x "$data_root/current/libexec/willow-dictate-ptt" \
+      && -x "$data_root/current/libexec/willow-dictate" \
+      && -x "$data_root/current/libexec/willow-voice-linux" ]]; then
+  ok 'bridge executables are installed'
+else
+  fail "bridge executables are incomplete under $data_root/current"
+fi
+if [[ -f "$data_root/current/app/Willow Voice.exe" \
+      && -f "$data_root/current/app/resources/app.asar" ]]; then
+  ok 'Willow application payload is present'
+else
+  fail 'Willow application payload is incomplete'
+fi
+
+prefix="$data_root/wineprefix"
+if [[ -L "$prefix" ]]; then
+  fail 'Wine prefix is a symlink'
+elif [[ -d "$prefix" ]]; then
+  prefix_mode=$(stat -Lc '%a' -- "$prefix" 2>/dev/null || printf '?')
+  if [[ "$prefix_mode" == 700 ]]; then
+    ok 'Wine prefix root is private (0700)'
+  else
+    warn "Wine prefix root mode is $prefix_mode; expected 700"
+  fi
+else
+  warn 'Wine prefix has not been created yet; launch Willow once'
+fi
+
+if [[ -w /dev/uinput ]]; then
+  ok '/dev/uinput is writable for the active user'
+else
+  fail '/dev/uinput is not writable; auto-paste cannot work'
+fi
+
+if command -v xdg-mime >/dev/null 2>&1; then
+  handler=$(xdg-mime query default x-scheme-handler/willow 2>/dev/null || true)
+  if [[ "$handler" == willow-voice-url.desktop ]]; then
+    ok 'willow:// login callback is registered'
+  else
+    fail "willow:// handler is ${handler:-unset}"
+  fi
+fi
+
+if systemctl --user is-active --quiet willow-ydotoold.service 2>/dev/null; then
+  ok 'private ydotool daemon is running'
+else
+  warn 'willow-ydotoold.service is not running'
+fi
+if systemctl --user is-active --quiet willow-dictate-ptt.service 2>/dev/null; then
+  ok 'KDE push-to-talk helper is running'
+else
+  warn 'willow-dictate-ptt.service is not running'
+fi
+if systemctl --user is-active --quiet willow-voice.service 2>/dev/null; then
+  ok 'Willow Wine service is running'
+else
+  warn 'willow-voice.service is not running'
+fi
+
+printf '\nSummary: %d failure(s), %d warning(s).\n' "$failures" "$warnings"
+(( failures == 0 ))
