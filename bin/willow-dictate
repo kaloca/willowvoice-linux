@@ -1,0 +1,442 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+die() {
+  printf 'willow-dictate: %s\n' "$*" >&2
+  exit 1
+}
+
+resolve_binary() {
+  local variable_name="$1" command_name="$2" current
+  current="${!variable_name:-}"
+  if [[ -z "$current" ]]; then
+    current=$(command -v "$command_name" || true)
+    printf -v "$variable_name" '%s' "$current"
+  fi
+  [[ -n "$current" && -x "$current" ]] || die "required command is unavailable: $command_name"
+}
+
+initialise_bridge() {
+  bridge_data_root="${WILLOW_BRIDGE_DATA_ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/willow-linux-bridge}"
+  prefix="${WILLOW_WINEPREFIX:-$bridge_data_root/wineprefix}"
+
+  [[ -n "${XDG_RUNTIME_DIR:-}" ]] || die 'XDG_RUNTIME_DIR is not set'
+  [[ -d "$XDG_RUNTIME_DIR" && -O "$XDG_RUNTIME_DIR" && ! -L "$XDG_RUNTIME_DIR" ]] \
+    || die 'XDG_RUNTIME_DIR must be an owned, non-symlinked directory'
+  local runtime_mode
+  runtime_mode=$(stat -Lc '%a' -- "$XDG_RUNTIME_DIR")
+  (( (8#$runtime_mode & 077) == 0 )) || die 'XDG_RUNTIME_DIR has unsafe permissions'
+
+  runtime_dir="$XDG_RUNTIME_DIR/willow-linux-bridge"
+  if [[ -L "$runtime_dir" ]]; then
+    die "refusing symlinked runtime directory: $runtime_dir"
+  fi
+  mkdir -p -- "$runtime_dir"
+  [[ -d "$runtime_dir" && -O "$runtime_dir" ]] || die 'runtime directory is not owned by this user'
+  chmod 0700 -- "$runtime_dir"
+
+  state_file="$runtime_dir/dictation.state"
+  generation_file="$runtime_dir/generation"
+  command_lock_file="$runtime_dir/command.lock"
+  paste_lock_file="$runtime_dir/paste.lock"
+  ydotool_socket="$XDG_RUNTIME_DIR/willow-ydotool/ydotool.sock"
+
+  xdotool_bin="${WILLOW_XDOTOOL_BIN:-}"
+  ydotool_bin="${WILLOW_YDOTOOL_BIN:-}"
+  wl_copy_bin="${WILLOW_WL_COPY_BIN:-}"
+  wl_paste_bin="${WILLOW_WL_PASTE_BIN:-}"
+  python_bin="${WILLOW_PYTHON_BIN:-}"
+  systemctl_bin="${WILLOW_SYSTEMCTL_BIN:-}"
+  cmp_bin="${WILLOW_CMP_BIN:-}"
+  resolve_binary xdotool_bin xdotool
+  resolve_binary ydotool_bin ydotool
+  resolve_binary wl_copy_bin wl-copy
+  resolve_binary wl_paste_bin wl-paste
+  resolve_binary python_bin python3
+  resolve_binary systemctl_bin systemctl
+  resolve_binary cmp_bin cmp
+}
+
+new_generation() {
+  local generation temporary
+  if [[ -r /proc/sys/kernel/random/uuid ]]; then
+    generation=$(< /proc/sys/kernel/random/uuid)
+  else
+    generation="$(date +%s%N)-$$-$RANDOM"
+  fi
+  temporary=$(mktemp "$runtime_dir/generation.XXXXXX")
+  printf '%s\n' "$generation" >"$temporary"
+  mv -f -- "$temporary" "$generation_file"
+  printf '%s\n' "$generation"
+}
+
+generation_is_current() {
+  local expected="$1" current=''
+  [[ -f "$generation_file" ]] || return 1
+  IFS= read -r current <"$generation_file" || true
+  [[ "$current" == "$expected" ]]
+}
+
+write_state() {
+  local temporary
+  temporary=$(mktemp "$runtime_dir/state.XXXXXX")
+  printf '%s\0' "$@" >"$temporary"
+  mv -f -- "$temporary" "$state_file"
+}
+
+read_state() {
+  state=()
+  [[ -f "$state_file" ]] || return 1
+  mapfile -d '' -t state <"$state_file"
+  (( ${#state[@]} >= 7 ))
+}
+
+find_data_root() {
+  local candidate log_mtime best_mtime=0 best=''
+  local -a candidates=()
+
+  if [[ -n "${WILLOW_DATA_ROOT:-}" ]]; then
+    [[ -d "$WILLOW_DATA_ROOT/Transcripts" ]] || return 1
+    printf '%s\n' "$WILLOW_DATA_ROOT"
+    return 0
+  fi
+
+  shopt -s nullglob
+  candidates=("$prefix"/drive_c/users/*/AppData/Roaming/willow-voice)
+  shopt -u nullglob
+  for candidate in "${candidates[@]}"; do
+    [[ -d "$candidate/Transcripts" ]] || continue
+    log_mtime=$(stat -Lc '%Y' -- "$candidate/logs/main.log" 2>/dev/null || printf '0')
+    if (( log_mtime >= best_mtime )); then
+      best="$candidate"
+      best_mtime=$log_mtime
+    fi
+  done
+  [[ -n "$best" ]] && printf '%s\n' "$best"
+}
+
+window_is_owned_willow() {
+  local window="$1" pid owner
+  [[ "$window" =~ ^[0-9]+$ ]] || return 1
+  pid=$("$xdotool_bin" getwindowpid "$window" 2>/dev/null || true)
+  [[ "$pid" =~ ^[0-9]+$ && -r "/proc/$pid/cmdline" ]] || return 1
+  owner=$(stat -Lc '%u' -- "/proc/$pid" 2>/dev/null || true)
+  [[ "$owner" == "$(id -u)" ]] || return 1
+  grep -Fazq -- 'Willow Voice.exe' "/proc/$pid/cmdline" 2>/dev/null
+}
+
+find_willow_window() {
+  local id geometry width height area
+  local best='' best_area=0
+  local -a ids=()
+
+  mapfile -t ids < <("$xdotool_bin" search --class 'willow voice.exe' 2>/dev/null || true)
+  for id in "${ids[@]}"; do
+    window_is_owned_willow "$id" || continue
+    geometry=$("$xdotool_bin" getwindowgeometry --shell "$id" 2>/dev/null || true)
+    width=$(sed -n 's/^WIDTH=//p' <<<"$geometry")
+    height=$(sed -n 's/^HEIGHT=//p' <<<"$geometry")
+    [[ "$width" =~ ^[0-9]+$ && "$height" =~ ^[0-9]+$ ]] || continue
+    area=$((width * height))
+    if (( area > best_area )); then
+      best="$id"
+      best_area=$area
+    fi
+  done
+  [[ -n "$best" ]] && printf '%s\n' "$best"
+}
+
+ensure_willow_window() {
+  local window=''
+  window=$(find_willow_window || true)
+  if [[ -z "$window" ]]; then
+    "$systemctl_bin" --user start willow-voice.service >/dev/null 2>&1 || return 1
+    for _ in {1..150}; do
+      sleep 0.1
+      window=$(find_willow_window || true)
+      [[ -n "$window" ]] && break
+    done
+  fi
+  [[ -n "$window" ]] && printf '%s\n' "$window"
+}
+
+wait_for_data_root() {
+  local data_root=''
+  for _ in {1..100}; do
+    data_root=$(find_data_root || true)
+    [[ -n "$data_root" ]] && break
+    sleep 0.1
+  done
+  [[ -n "$data_root" ]] && printf '%s\n' "$data_root"
+}
+
+find_recording_id() {
+  local generation="$1" log_file="$2" log_offset="$3" transcript_id=''
+  local start_byte=$((log_offset + 1))
+
+  for _ in {1..100}; do
+    generation_is_current "$generation" || return 1
+    if [[ -f "$log_file" && ! -L "$log_file" && -O "$log_file" ]] \
+        && (( $(stat -Lc '%s' -- "$log_file" 2>/dev/null || printf '0') >= log_offset )); then
+      transcript_id=$(tail -c "+$start_byte" -- "$log_file" 2>/dev/null \
+        | sed -nE "s/.*Recording started.*transcriptId: '([0-9a-fA-F-]{36})'.*/\\1/p" \
+        | head -n 1)
+      if [[ "$transcript_id" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]]; then
+        printf '%s\n' "$transcript_id"
+        return 0
+      fi
+    fi
+    sleep 0.05
+  done
+  return 1
+}
+
+extract_transcript() {
+  local json_file="$1" output_file="$2"
+  "$python_bin" - "$json_file" "$output_file" <<'PY'
+import json
+import os
+import sys
+
+source, destination = sys.argv[1:]
+try:
+    with open(source, "r", encoding="utf-8") as handle:
+        record = json.load(handle)
+except (OSError, UnicodeError, json.JSONDecodeError):
+    raise SystemExit(2)
+
+if record.get("isPlaceholder"):
+    raise SystemExit(4)
+text = record.get("query")
+if not isinstance(text, str):
+    raise SystemExit(2)
+if not text.strip():
+    raise SystemExit(3)
+
+descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as handle:
+    handle.write(text)
+PY
+}
+
+clipboard_matches_file() {
+  local expected="$1"
+  "$cmp_bin" -s -- "$expected" \
+    <(timeout 3s "$wl_paste_bin" --type 'text/plain;charset=utf-8' --no-newline 2>/dev/null)
+}
+
+deliver_transcript() {
+  local generation="$1" transcript_file="$2"
+
+  exec 8>"$paste_lock_file"
+  flock -w 30 8 || return 1
+  generation_is_current "$generation" || return 1
+
+  "$wl_copy_bin" --foreground --sensitive --type 'text/plain;charset=utf-8' \
+    <"$transcript_file" >/dev/null 2>&1 &
+  copy_pid=$!
+
+  local clipboard_ready=0
+  for _ in {1..30}; do
+    if clipboard_matches_file "$transcript_file"; then
+      clipboard_ready=1
+      break
+    fi
+    kill -0 "$copy_pid" 2>/dev/null || break
+    sleep 0.05
+  done
+  (( clipboard_ready == 1 )) || return 1
+
+  "$systemctl_bin" --user start willow-ydotoold.service >/dev/null 2>&1 || true
+  for _ in {1..40}; do
+    [[ -S "$ydotool_socket" ]] && break
+    sleep 0.05
+  done
+
+  sleep 0.15
+  if ! generation_is_current "$generation" \
+      || ! clipboard_matches_file "$transcript_file" \
+      || [[ ! -S "$ydotool_socket" ]]; then
+    if clipboard_matches_file "$transcript_file"; then
+      "$wl_copy_bin" --clear >/dev/null 2>&1 || true
+    fi
+    return 1
+  fi
+
+  if YDOTOOL_SOCKET="$ydotool_socket" "$ydotool_bin" key 29:1 47:1 47:0 29:0; then
+    sleep 2
+  fi
+  if clipboard_matches_file "$transcript_file"; then
+    "$wl_copy_bin" --clear >/dev/null 2>&1 || true
+  fi
+}
+
+paste_transcript_when_ready() {
+  local generation="$1" data_root="$2" transcript_id="$3"
+  local json_file worker_dir transcript_file status=0 copy_pid=''
+
+  worker_dir=$(mktemp -d "$runtime_dir/worker.XXXXXX")
+  transcript_file="$worker_dir/transcript"
+  cleanup_worker() {
+    if [[ -f "$transcript_file" ]] && clipboard_matches_file "$transcript_file"; then
+      "$wl_copy_bin" --clear >/dev/null 2>&1 || true
+    fi
+    if [[ -S "$ydotool_socket" ]]; then
+      YDOTOOL_SOCKET="$ydotool_socket" "$ydotool_bin" key 47:0 29:0 \
+        >/dev/null 2>&1 || true
+    fi
+    if [[ -n "$copy_pid" ]]; then
+      kill -TERM "$copy_pid" 2>/dev/null || true
+      for _ in {1..20}; do
+        kill -0 "$copy_pid" 2>/dev/null || break
+        sleep 0.01
+      done
+      kill -KILL "$copy_pid" 2>/dev/null || true
+      wait "$copy_pid" 2>/dev/null || true
+    fi
+    rm -rf -- "$worker_dir"
+  }
+  trap cleanup_worker EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
+  generation_is_current "$generation" || return 1
+  json_file="$data_root/Transcripts/$transcript_id.json"
+
+  for _ in {1..600}; do
+    generation_is_current "$generation" || return 1
+    if [[ -f "$json_file" && ! -L "$json_file" && -O "$json_file" \
+        && $(stat -Lc '%s' -- "$json_file" 2>/dev/null || printf '999999999') -le 4194304 ]]; then
+      set +e
+      extract_transcript "$json_file" "$transcript_file"
+      status=$?
+      set -e
+      if (( status == 0 )) && [[ -s "$transcript_file" ]]; then
+        # Let Willow's Windows clipboard path settle before taking ownership.
+        sleep 1
+        generation_is_current "$generation" || return 1
+        deliver_transcript "$generation" "$transcript_file"
+        return
+      fi
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
+start_recording() {
+  local generation window data_root log_file log_offset transcript_id=''
+  [[ ! -f "$state_file" ]] || return 0
+
+  generation=$(new_generation)
+  window=$(ensure_willow_window) || return 1
+  data_root=$(wait_for_data_root) || return 1
+  log_file="$data_root/logs/main.log"
+  if [[ -e "$log_file" || -L "$log_file" ]]; then
+    [[ -f "$log_file" && ! -L "$log_file" && -O "$log_file" ]] || return 1
+    log_offset=$(stat -Lc '%s' -- "$log_file") || return 1
+  else
+    log_offset=0
+  fi
+  [[ "$log_offset" =~ ^[0-9]+$ ]] || return 1
+
+  write_state starting "$generation" "$window" "$data_root" "$log_file" "$log_offset" ''
+  if ! "$xdotool_bin" keydown --window "$window" Control_L+Super_L; then
+    rm -f -- "$state_file"
+    return 1
+  fi
+  transcript_id=$(find_recording_id "$generation" "$log_file" "$log_offset" || true)
+  if [[ -z "$transcript_id" ]]; then
+    "$xdotool_bin" keyup --window "$window" Control_L+Super_L 2>/dev/null || true
+    rm -f -- "$state_file"
+    return 1
+  fi
+  if ! write_state active "$generation" "$window" "$data_root" "$log_file" "$log_offset" "$transcript_id"; then
+    "$xdotool_bin" keyup --window "$window" Control_L+Super_L 2>/dev/null || true
+    rm -f -- "$state_file"
+    return 1
+  fi
+}
+
+stop_recording() {
+  local -a state=()
+  local phase generation window data_root log_file log_offset transcript_id
+  [[ -f "$state_file" ]] || return 0
+  read_state || {
+    rm -f -- "$state_file"
+    return 1
+  }
+  phase="${state[0]}"
+  generation="${state[1]}"
+  window="${state[2]}"
+  data_root="${state[3]}"
+  log_file="${state[4]}"
+  log_offset="${state[5]}"
+  transcript_id="${state[6]}"
+
+  if [[ "$window" =~ ^[0-9]+$ ]]; then
+    "$xdotool_bin" keyup --window "$window" Control_L+Super_L 2>/dev/null || true
+  fi
+  rm -f -- "$state_file"
+
+  [[ "$phase" == active \
+      && "$transcript_id" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ \
+      && -d "$data_root/Transcripts" ]] \
+    || return 0
+  (
+    exec 9>&-
+    paste_transcript_when_ready "$generation" "$data_root" "$transcript_id" || true
+  ) >/dev/null 2>&1 &
+}
+
+reset_bridge() {
+  local -a state=()
+  local window=''
+  new_generation >/dev/null
+  if read_state; then
+    window="${state[2]:-}"
+    if [[ "$window" =~ ^[0-9]+$ ]]; then
+      "$xdotool_bin" keyup --window "$window" Control_L+Super_L 2>/dev/null || true
+    fi
+  fi
+  rm -f -- "$state_file"
+}
+
+main() {
+  initialise_bridge
+  exec 9>"$command_lock_file"
+  flock -w 3 9 || exit 75
+
+  case "${1:-toggle}" in
+    start)
+      [[ $# -eq 1 ]] || exit 2
+      start_recording
+      ;;
+    stop)
+      [[ $# -eq 1 ]] || exit 2
+      stop_recording
+      ;;
+    reset)
+      [[ $# -eq 1 ]] || exit 2
+      reset_bridge
+      ;;
+    toggle)
+      [[ $# -le 1 ]] || exit 2
+      if [[ -f "$state_file" ]]; then
+        stop_recording
+      else
+        start_recording
+      fi
+      ;;
+    *)
+      printf '%s\n' 'Usage: willow-dictate [start|stop|reset|toggle]' >&2
+      exit 2
+      ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

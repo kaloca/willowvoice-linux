@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+if [[ " $* " == *' --clear '* ]]; then
+  : >"$FAKE_CLIPBOARD"
+  exit 0
+fi
+cp /dev/stdin "$FAKE_CLIPBOARD"
+trap 'exit 0' TERM INT HUP
+while :; do
+  sleep 1
+done

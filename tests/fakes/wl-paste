@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+[[ -f "$FAKE_CLIPBOARD" ]] && cp "$FAKE_CLIPBOARD" /dev/stdout
