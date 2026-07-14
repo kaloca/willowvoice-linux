@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Willow Voice login callback
+Comment=Open Willow authentication callbacks in Willow Voice
+Exec="@LIBEXEC@/willow-voice-linux" --callback %u
+NoDisplay=true
+Terminal=false
+StartupNotify=false
+MimeType=x-scheme-handler/willow;

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Willow Voice
+Comment=Willow Voice through the Windows client and Wine
+Exec="@LIBEXEC@/willow-voice-linux"
+Icon=@ICON@
+Terminal=false
+StartupNotify=true
+StartupWMClass=willow voice.exe
+Categories=AudioVideo;Audio;

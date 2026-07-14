@@ -1,0 +1,17 @@
+[Unit]
+Description=Willow Voice Windows client under Wine
+PartOf=graphical-session.target
+
+[Service]
+Type=exec
+ExecStart="@LIBEXEC@/willow-voice-linux" --foreground
+ExecStop="@LIBEXEC@/willow-voice-linux" --stop
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=15
+UMask=0077
+NoNewPrivileges=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=graphical-session.target

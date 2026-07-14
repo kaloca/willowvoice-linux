@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Willow Push-to-Talk
+Comment=Hold a KDE global shortcut to dictate with Willow Voice
+Exec="@LIBEXEC@/willow-dictate-ptt" --bridge "@LIBEXEC@/willow-dictate"
+Icon=audio-input-microphone
+Terminal=false
+StartupNotify=false
+NoDisplay=true
+Categories=AudioVideo;Audio;

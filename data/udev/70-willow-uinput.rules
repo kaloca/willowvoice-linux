@@ -1,0 +1,3 @@
+# Give the active local desktop user access to /dev/uinput. Deliberately do not
+# use MODE=0666 or the broad input group.
+ACTION=="add|change", KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uinput"
