@@ -31,18 +31,14 @@ For upstream client/account guidance, use Willow's
 [official download page](https://willowvoice.com/download) and
 [installation guide](https://help.willowvoice.com/en/articles/10876111-install-and-setup-willow-voice-mac-windows).
 
-## Copy it to another computer
+## Clone it on another computer
 
-Copy either this directory or the clean archive next to it to your other Arch
-computer. For example:
+On your other Arch computer, clone this repository and enter the project
+directory:
 
 ```bash
-scp willow-linux-bridge-0.1.0.tar.gz \
-  willow-linux-bridge-0.1.0.tar.gz.sha256 other-computer:~/
-ssh other-computer
-sha256sum -c willow-linux-bridge-0.1.0.tar.gz.sha256
-tar -xzf willow-linux-bridge-0.1.0.tar.gz
-cd willow-linux-bridge
+git clone https://github.com/kaloca/willowvoice-linux.git
+cd willowvoice-linux
 ```
 
 You can inspect what the installer would do without changing anything:
@@ -53,7 +49,7 @@ You can inspect what the installer would do without changing anything:
 
 ## Install
 
-From a terminal inside the copied directory, run:
+From a terminal inside the cloned directory, run:
 
 ```bash
 ./install.sh --install-deps --configure-uinput
