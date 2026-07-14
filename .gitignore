@@ -1,0 +1,25 @@
+/build/
+/cmake-build-*/
+/CMakeCache.txt
+/CMakeFiles/
+/CTestTestfile.cmake
+/Testing/
+/build.ninja
+/cmake_install.cmake
+/compile_commands.json
+/.cache/
+/.staging/
+/willow-linux-bridge-*.tar.gz*
+.DS_Store
+*.swp
+*.dmg
+*.exe
+*.7z
+*.AppImage
+wineprefix/
+Transcripts/
+logs/
+session.json
+config.json
+Cookies
+Local Storage/

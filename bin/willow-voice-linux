@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+bridge_data_root="${WILLOW_BRIDGE_DATA_ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/willow-linux-bridge}"
+app="${WILLOW_APP_EXE:-$bridge_data_root/current/app/Willow Voice.exe}"
+prefix="${WILLOW_WINEPREFIX:-$bridge_data_root/wineprefix}"
+wine="${WILLOW_WINE_BIN:-$(command -v wine || true)}"
+wineserver="${WILLOW_WINESERVER_BIN:-$(command -v wineserver || true)}"
+
+die() {
+  printf 'willow-voice-linux: %s\n' "$*" >&2
+  exit 1
+}
+
+prepare_prefix() {
+  if [[ -L "$prefix" ]]; then
+    die "refusing symlinked Wine prefix: $prefix"
+  fi
+  if [[ -e "$prefix" && ( ! -d "$prefix" || ! -O "$prefix" ) ]]; then
+    die "Wine prefix must be a directory owned by the current user: $prefix"
+  fi
+  mkdir -p -- "$prefix"
+  chmod 0700 -- "$prefix"
+}
+
+valid_callback_url() {
+  local url="$1" query pair key value code='' posthog=''
+  local code_seen=0 posthog_seen=0
+  local -a pairs=()
+
+  (( ${#url} <= 4096 )) || return 1
+  [[ "$url" == willow://login-callback\?* ]] || return 1
+  [[ "$url" != *[$'\r\n\t ']* && "$url" != *'#'* ]] || return 1
+  query="${url#willow://login-callback\?}"
+  [[ -n "$query" ]] || return 1
+  [[ "$query" != '&'* && "$query" != *'&' && "$query" != *'&&'* ]] || return 1
+
+  IFS='&' read -r -a pairs <<<"$query"
+  for pair in "${pairs[@]}"; do
+    [[ "$pair" == *=* ]] || return 1
+    key="${pair%%=*}"
+    value="${pair#*=}"
+    case "$key" in
+      code)
+        (( code_seen == 0 )) || return 1
+        code_seen=1
+        code="$value"
+        ;;
+      posthog_distinct_id)
+        (( posthog_seen == 0 )) || return 1
+        posthog_seen=1
+        posthog="$value"
+        ;;
+      *) return 1 ;;
+    esac
+  done
+
+  (( code_seen == 1 )) || return 1
+  [[ "$code" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] \
+    || return 1
+  if (( posthog_seen == 1 )); then
+    [[ -n "$posthog" ]] || return 1
+    (( ${#posthog} <= 200 )) || return 1
+    [[ "$posthog" =~ ^[A-Za-z0-9._~-]+$ ]] || return 1
+  fi
+}
+
+main() {
+  [[ -n "$wine" && -x "$wine" ]] || die "Wine is not installed"
+  [[ -f "$app" ]] || die "Willow Voice is not installed at $app"
+  prepare_prefix
+
+  export WINEPREFIX="$prefix"
+  export WINEARCH=win64
+  export WINEDLLOVERRIDES='mscoree,mshtml='
+  export WINEDEBUG=-all
+
+  # Keep Wine on X11/XWayland. The bridge intentionally addresses Willow's
+  # window with xdotool, which cannot see a native Wayland Wine window.
+  unset WAYLAND_DISPLAY
+
+  case "${1:-}" in
+    --callback)
+      [[ $# -eq 2 ]] || die "expected exactly one callback URL"
+      valid_callback_url "$2" || die "rejected malformed Willow login callback"
+      exec "$wine" start /unix "$app" "$2"
+      ;;
+    --stop)
+      [[ $# -eq 1 ]] || die "--stop takes no arguments"
+      [[ -n "$wineserver" && -x "$wineserver" ]] || die "wineserver is not installed"
+      exec "$wineserver" -k
+      ;;
+    --version)
+      printf '%s\n' 'willow-linux-bridge 0.1.0'
+      ;;
+    --foreground)
+      [[ $# -eq 1 ]] || die "--foreground takes no arguments"
+      exec "$wine" "$app" --disable-gpu
+      ;;
+    '')
+      exec "$wine" start /unix "$app" --disable-gpu
+      ;;
+    *)
+      printf '%s\n' 'Usage: willow-voice-linux [--callback URL | --foreground | --stop | --version]' >&2
+      exit 2
+      ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
